@@ -1,5 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+// Copyright (C) 2021-2022 Dai Foundation
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 pragma solidity ^0.8.17;
 
 import "dss-test/DssTest.sol";
@@ -38,7 +53,7 @@ contract MockMultisig is IERC1271 {
     }
 }
 
-contract SavingsDaiIntegrationTest is DSSTest {
+contract SavingsDaiIntegrationTest is DssTest {
 
     using GodMode for *;
 
@@ -53,11 +68,12 @@ contract SavingsDaiIntegrationTest is DSSTest {
     event Approval(address indexed owner, address indexed spender, uint256 amount);
     event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares);
     event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares);
+    event Referral(uint16 indexed referral, address indexed owner, uint256 assets, uint256 shares);
 
     bytes32 constant PERMIT_TYPEHASH =
         keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
 
-    function setUp() public override {
+    function setUp() public {
         ChainlogAbstract chainlog = ChainlogAbstract(0xdA0Ab1e0017DEbCd72Be8599041a2aa3bA7e740F);
         
         vat = VatAbstract(chainlog.getAddress("MCD_VAT"));
@@ -126,6 +142,23 @@ contract SavingsDaiIntegrationTest is DSSTest {
         assertEq(vat.dai(address(pot)), dsrDai + pie * pot.chi());
     }
 
+    function testReferredDeposit() public {
+        uint256 dsrDai = vat.dai(address(pot));
+
+        uint256 pie = 1e18 * RAY / pot.chi();
+        vm.expectEmit(true, true, true, true);
+        emit Deposit(address(this), address(0xBEEF), 1e18, pie);
+        vm.expectEmit(true, true, true, true);
+        emit Referral(888, address(0xBEEF), 1e18, pie);
+        token.deposit(1e18, address(0xBEEF), 888);
+
+        assertEq(token.totalSupply(), pie);
+        assertLe(token.totalAssets(), 1e18);    // May be slightly less due to rounding error
+        assertGe(token.totalAssets(), 1e18 - 1);
+        assertEq(token.balanceOf(address(0xBEEF)), pie);
+        assertEq(vat.dai(address(pot)), dsrDai + pie * pot.chi());
+    }
+
     function testDepositBadAddress() public {
         vm.expectRevert("SavingsDai/invalid-address");
         token.deposit(1e18, address(0));
@@ -140,6 +173,23 @@ contract SavingsDaiIntegrationTest is DSSTest {
         vm.expectEmit(true, true, true, true);
         emit Deposit(address(this), address(0xBEEF), _divup(pie * pot.chi(), RAY), pie);
         token.mint(pie, address(0xBEEF));
+
+        assertEq(token.totalSupply(), pie);
+        assertLe(token.totalAssets(), 1e18);    // May be slightly less due to rounding error
+        assertGe(token.totalAssets(), 1e18 - 1);
+        assertEq(token.balanceOf(address(0xBEEF)), pie);
+        assertEq(vat.dai(address(pot)), dsrDai + pie * pot.chi());
+    }
+
+    function testReferredMint() public {
+        uint256 dsrDai = vat.dai(address(pot));
+
+        uint256 pie = 1e18 * RAY / pot.chi();
+        vm.expectEmit(true, true, true, true);
+        emit Deposit(address(this), address(0xBEEF), _divup(pie * pot.chi(), RAY), pie);
+        vm.expectEmit(true, true, true, true);
+        emit Referral(888, address(0xBEEF), 1e18, pie);
+        token.mint(pie, address(0xBEEF), 888);
 
         assertEq(token.totalSupply(), pie);
         assertLe(token.totalAssets(), 1e18);    // May be slightly less due to rounding error
@@ -492,7 +542,7 @@ contract SavingsDaiIntegrationTest is DSSTest {
     function testPermitPastDeadline() public {
         uint256 privateKey = 0xBEEF;
         address owner = vm.addr(privateKey);
-        uint256 deadline = block.timestamp == 0 ? 0 : block.timestamp - 1;
+        uint256 deadline = block.timestamp;
 
         bytes32 domain_separator = token.DOMAIN_SEPARATOR();
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(
@@ -510,6 +560,11 @@ contract SavingsDaiIntegrationTest is DSSTest {
 
         vm.expectRevert("SavingsDai/permit-expired");
         token.permit(owner, address(0xCAFE), 1e18, deadline, v, r, s);
+    }
+
+    function testPermitOwnerZero() public {
+        vm.expectRevert("SavingsDai/invalid-owner");
+        token.permit(address(0), address(0xCAFE), 1e18, block.timestamp, 28, bytes32(0), bytes32(0));
     }
 
     function testPermitReplay() public {
@@ -581,6 +636,9 @@ contract SavingsDaiIntegrationTest is DSSTest {
         vm.warp(block.timestamp + warp % 365 days);
         if (from == address(0) || from == address(token)) return;
 
+        uint256 initialFromBalance = dai.balanceOf(from);
+        uint256 initialTestBalance = dai.balanceOf(TEST_ADDRESS);
+
         uint256 pie = token.convertToShares(mintAmount);
         burnAmount = bound(burnAmount, 0, pie);
 
@@ -593,8 +651,8 @@ contract SavingsDaiIntegrationTest is DSSTest {
         uint256 aassets = token.redeem(burnAmount, TEST_ADDRESS, from);
 
         assertEq(aassets, assets);
-        if (from != TEST_ADDRESS) assertEq(dai.balanceOf(from), 0);
-        assertEq(dai.balanceOf(TEST_ADDRESS), assets);
+        if (from != TEST_ADDRESS) assertEq(dai.balanceOf(from), initialFromBalance);
+        assertEq(dai.balanceOf(TEST_ADDRESS), initialTestBalance + assets);
     }
 
     function testWithdraw(
@@ -608,6 +666,9 @@ contract SavingsDaiIntegrationTest is DSSTest {
         vm.warp(block.timestamp + warp % 365 days);
         if (from == address(0) || from == address(token)) return;
 
+        uint256 initialFromBalance = dai.balanceOf(from);
+        uint256 initialTestBalance = dai.balanceOf(TEST_ADDRESS);
+
         uint256 pie = token.convertToShares(mintAmount);
         burnAmount = bound(burnAmount, 0, mintAmount);
 
@@ -620,8 +681,8 @@ contract SavingsDaiIntegrationTest is DSSTest {
         uint256 ashares = token.withdraw(burnAmount, TEST_ADDRESS, from);
 
         assertEq(ashares, shares);
-        if (from != TEST_ADDRESS) assertEq(dai.balanceOf(from), 0);
-        assertEq(dai.balanceOf(TEST_ADDRESS), burnAmount);
+        if (from != TEST_ADDRESS) assertEq(dai.balanceOf(from), initialFromBalance);
+        assertEq(dai.balanceOf(TEST_ADDRESS), initialTestBalance + burnAmount);
         assertEq(token.totalSupply(), pie - shares);
         assertEq(token.balanceOf(from), pie - shares);
     }
@@ -731,7 +792,7 @@ contract SavingsDaiIntegrationTest is DSSTest {
         if (to == address(0) || to == address(token)) return;
 
         uint256 pie = mintAmount * RAY / pot.chi();
-        burnAmount = bound(burnAmount, pie + 1, type(uint256).max);
+        burnAmount = bound(burnAmount, pie + 1, type(uint256).max / pot.chi());
 
         token.deposit(mintAmount, to);
         vm.expectRevert("SavingsDai/insufficient-balance");
@@ -865,7 +926,6 @@ contract SavingsDaiIntegrationTest is DSSTest {
         uint256 deadline
     ) public {
         if (deadline == type(uint256).max) deadline -= 1;
-        vm.warp(deadline);
 
         // private key cannot be 0 for secp256k1 pubkey generation
         if (privateKey == 0) privateKey = 1;
